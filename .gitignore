@@ -1,20 +1,23 @@
-.env
-venv/
-.venv/
-__pycache__/
-*.pyc
-uploads/
-mailflow.db
-mailflow.db-shm
-mailflow.db-wal
-.venv/
-.venv311/
-venv/
-__pycache__/
-*.py[cod]
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
+
+# Python virtual environments
+venv/
+.venv/
+.venv311/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Uploaded files
+uploads/
+
+# SQLite databases and related files
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
