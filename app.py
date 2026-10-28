@@ -26,9 +26,11 @@ app.config.from_object(Config)
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 os.makedirs(Config.CAMPAIGN_ATTACHMENT_FOLDER, exist_ok=True)
 database.init_database()
-app.logger.info("[STARTUP] MailFlow database initialized; starting campaign manager")
-campaign_manager.start()
-app.logger.info("[STARTUP] Flask app import completed; campaign manager start requested")
+app.logger.info(
+    "[STARTUP] MailFlow database initialized; "
+    "campaign manager startup deferred to Gunicorn worker hook"
+)
+app.logger.info("[STARTUP] Flask app import completed")
 
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 
@@ -257,19 +259,7 @@ def send_emails():
                 unsupported.update(unsupported_placeholders(body, data))
             if unsupported:
                 raise ValueError("Unsupported template placeholder(s): " + ", ".join(sorted(unsupported)) + ". Use {person_name | default: \"Hiring Team\"} and {company | default: \"your organization\"}, or match a contact-file column header.")
-        # Keep the call compatible with database.py versions whose
-        # create_campaign() signature does not include personalization_enabled.
-        # email_worker.personalize_text() only changes recognized placeholders.
-        campaign_id = database.create_campaign(
-            recipient_records,
-            subject,
-            body,
-            attachments,
-            scheduled_at,
-            timezone_name,
-            request.form.get("campaign_name", "").strip() or None,
-            campaign_id,
-        )
+        campaign_id = database.create_campaign(recipient_records, subject, body, attachments, scheduled_at, timezone_name, request.form.get("campaign_name", "").strip() or None, campaign_id, personalization_enabled=personalization_enabled)
         app.logger.info(
             "[CAMPAIGN] Created campaign_id=%s recipients=%s scheduled=%s",
             campaign_id, len(recipient_records), bool(scheduled_at),
@@ -287,11 +277,7 @@ def send_emails():
         app.logger.exception("Campaign storage error")
         message = "Unable to create campaign because storage is full." if "full" in str(exc).lower() else "Unable to create campaign because the database could not be written."
         return jsonify(success=False, message=message), 507 if "full" in str(exc).lower() else 500
-    except RuntimeError as exc:
-        app.logger.exception("Campaign queueing error for campaign_id=%s", campaign_id)
-        # Do not delete campaign attachments here: the database campaign may
-        # already have been committed before enqueueing failed.
-        return jsonify(success=False, message=str(exc), campaign_id=campaign_id), 503
+    except RuntimeError as exc: return jsonify(success=False, message=str(exc)), 503
     except Exception as exc:
         if campaign_id: shutil.rmtree(os.path.join(Config.CAMPAIGN_ATTACHMENT_FOLDER, campaign_id), ignore_errors=True)
         app.logger.exception("Campaign creation error"); return jsonify(success=False, message="Could not create campaign."), 500
@@ -330,4 +316,6 @@ def delete_campaign(campaign_id):
 def request_too_large(_): return jsonify(success=False, message="Upload exceeds MAX_CONTENT_LENGTH."), 413
 
 
-if __name__ == "__main__": app.run(debug=False)
+if __name__ == "__main__":
+    campaign_manager.start()
+    app.run(debug=False)
