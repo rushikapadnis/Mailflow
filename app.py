@@ -4,6 +4,7 @@ import shutil
 import sqlite3
 import uuid
 import json
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -17,12 +18,17 @@ import database
 from config import Config
 from email_worker import campaign_manager, estimate_message_size, unsupported_placeholders
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s")
+logging.getLogger().setLevel(logging.INFO)
+
 app = Flask(__name__)
 app.config.from_object(Config)
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 os.makedirs(Config.CAMPAIGN_ATTACHMENT_FOLDER, exist_ok=True)
 database.init_database()
+app.logger.info("[STARTUP] MailFlow database initialized; starting campaign manager")
 campaign_manager.start()
+app.logger.info("[STARTUP] Flask app import completed; campaign manager start requested")
 
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 
@@ -251,8 +257,26 @@ def send_emails():
                 unsupported.update(unsupported_placeholders(body, data))
             if unsupported:
                 raise ValueError("Unsupported template placeholder(s): " + ", ".join(sorted(unsupported)) + ". Use {person_name | default: \"Hiring Team\"} and {company | default: \"your organization\"}, or match a contact-file column header.")
-        campaign_id = database.create_campaign(recipient_records, subject, body, attachments, scheduled_at, timezone_name, request.form.get("campaign_name", "").strip() or None, campaign_id, personalization_enabled=personalization_enabled)
-        if not scheduled_at: campaign_manager.enqueue(campaign_id)
+        # Keep the call compatible with database.py versions whose
+        # create_campaign() signature does not include personalization_enabled.
+        # email_worker.personalize_text() only changes recognized placeholders.
+        campaign_id = database.create_campaign(
+            recipient_records,
+            subject,
+            body,
+            attachments,
+            scheduled_at,
+            timezone_name,
+            request.form.get("campaign_name", "").strip() or None,
+            campaign_id,
+        )
+        app.logger.info(
+            "[CAMPAIGN] Created campaign_id=%s recipients=%s scheduled=%s",
+            campaign_id, len(recipient_records), bool(scheduled_at),
+        )
+        if not scheduled_at:
+            campaign_manager.enqueue(campaign_id)
+            app.logger.info("[CAMPAIGN] Enqueue requested for campaign_id=%s", campaign_id)
         campaign = database.get_campaign(campaign_id)
         return jsonify(success=True, message="Campaign scheduled." if scheduled_at else "Campaign accepted and queued.", campaign_id=campaign_id, estimated_email_size=estimated_size, **campaign), 202
     except ValueError as exc:
@@ -263,7 +287,11 @@ def send_emails():
         app.logger.exception("Campaign storage error")
         message = "Unable to create campaign because storage is full." if "full" in str(exc).lower() else "Unable to create campaign because the database could not be written."
         return jsonify(success=False, message=message), 507 if "full" in str(exc).lower() else 500
-    except RuntimeError as exc: return jsonify(success=False, message=str(exc)), 503
+    except RuntimeError as exc:
+        app.logger.exception("Campaign queueing error for campaign_id=%s", campaign_id)
+        # Do not delete campaign attachments here: the database campaign may
+        # already have been committed before enqueueing failed.
+        return jsonify(success=False, message=str(exc), campaign_id=campaign_id), 503
     except Exception as exc:
         if campaign_id: shutil.rmtree(os.path.join(Config.CAMPAIGN_ATTACHMENT_FOLDER, campaign_id), ignore_errors=True)
         app.logger.exception("Campaign creation error"); return jsonify(success=False, message="Could not create campaign."), 500

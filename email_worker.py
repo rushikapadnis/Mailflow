@@ -1,5 +1,6 @@
 """Background campaign workers, MIME construction, and SMTP lifecycle management."""
 import html
+import json
 import logging
 import mimetypes
 import os
@@ -16,6 +17,8 @@ from email.utils import formataddr
 from config import Config
 import database
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s")
+logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -295,46 +298,111 @@ class CampaignManager:
 
     def start(self):
         if self.started:
+            logger.info("[STARTUP] CampaignManager.start() called again; manager already started")
             return
+
         self.started = True
+        logger.info(
+            "[STARTUP] Starting MailFlow campaign manager: smtp_workers=%s recipient_queue_size=%s",
+            Config.EMAIL_WORKERS,
+            Config.EMAIL_QUEUE_SIZE,
+        )
+
+        # Start the dispatcher before SMTP workers so queued campaigns can be
+        # observed immediately. Every thread is daemonized because Gunicorn
+        # owns the web-process lifecycle.
+        threading.Thread(target=self._dispatcher, name="mailflow-dispatcher", daemon=True).start()
         for index in range(Config.EMAIL_WORKERS):
             threading.Thread(target=self._worker, name=f"mailflow-smtp-{index + 1}", daemon=True).start()
-        threading.Thread(target=self._dispatcher, name="mailflow-dispatcher", daemon=True).start()
         threading.Thread(target=self._scheduler, name="mailflow-scheduler", daemon=True).start()
-        for campaign_id in database.recover_campaigns():
-            self.enqueue(campaign_id)
+
+        try:
+            recovered = database.recover_campaigns()
+            logger.info("[STARTUP] Recovery returned %s campaign(s)", len(recovered))
+            for campaign_id in recovered:
+                self.enqueue(campaign_id)
+        except Exception:
+            # A recovery-query failure must be visible in Render logs; it must
+            # not silently prevent the long-running worker threads from starting.
+            logger.exception("[STARTUP] Campaign recovery failed")
 
     def enqueue(self, campaign_id):
+        if not campaign_id:
+            raise ValueError("campaign_id is required")
         with self.lock:
             if campaign_id in self.enqueued:
+                logger.info("[QUEUE] campaign_id=%s is already queued for dispatch", campaign_id)
                 return
             self.enqueued.add(campaign_id)
         try:
             self.campaign_queue.put_nowait(campaign_id)
-        except queue.Full:
+            logger.info("[QUEUE] Enqueued campaign_id=%s campaign_queue_size=%s", campaign_id, self.campaign_queue.qsize())
+        except queue.Full as exc:
             with self.lock:
                 self.enqueued.discard(campaign_id)
-            raise RuntimeError("Campaign queue is busy; please try again shortly.")
+            logger.exception("[QUEUE] Campaign queue is full for campaign_id=%s", campaign_id)
+            raise RuntimeError("Campaign queue is busy; please try again shortly.") from exc
 
     def _dispatcher(self):
+        logger.info("[DISPATCHER] Thread started")
         while True:
             campaign_id = self.campaign_queue.get()
+            should_retry = False
             try:
-                for recipient_id in database.queued_recipient_ids(campaign_id):
-                    self.recipient_queue.put(recipient_id)
+                logger.info("[DISPATCHER] Loading queued recipients for campaign_id=%s", campaign_id)
+                recipient_ids = database.queued_recipient_ids(campaign_id)
+                logger.info(
+                    "[DISPATCHER] campaign_id=%s queued_recipients=%s recipient_queue_size=%s",
+                    campaign_id, len(recipient_ids), self.recipient_queue.qsize(),
+                )
+                # Keep campaign ownership with each queue item. This prevents a
+                # stale recipient ID from being claimed under another campaign.
+                # The queue is bounded; put() intentionally applies backpressure
+                # while SMTP workers consume recipients.
+                for recipient_id in recipient_ids:
+                    self.recipient_queue.put((campaign_id, recipient_id))
+                logger.info(
+                    "[DISPATCHER] Dispatch complete for campaign_id=%s; recipient_queue_size=%s",
+                    campaign_id, self.recipient_queue.qsize(),
+                )
+            except Exception:
+                # Without this guard, one SQLite/query exception could terminate
+                # the dispatcher forever while the UI remains stuck at Queued.
+                logger.exception("[DISPATCHER] Failed to dispatch campaign_id=%s; will retry", campaign_id)
+                should_retry = True
             finally:
                 with self.lock:
                     self.enqueued.discard(campaign_id)
                 self.campaign_queue.task_done()
+            if should_retry:
+                time.sleep(2)
+                try:
+                    self.enqueue(campaign_id)
+                except Exception:
+                    logger.exception("[DISPATCHER] Could not requeue campaign_id=%s", campaign_id)
 
     def _scheduler(self):
+        logger.info("[SCHEDULER] Thread started")
         while True:
             try:
-                for campaign_id in database.activate_due_campaigns():
+                due_campaigns = database.activate_due_campaigns()
+                for campaign_id in due_campaigns:
+                    logger.info("[SCHEDULER] Activating due campaign_id=%s", campaign_id)
                     self.enqueue(campaign_id)
-                database.cleanup_expired_attachment_files(Config.ATTACHMENT_RETENTION_SECONDS)
+
+                # Some database versions also expose retry/resume activation.
+                # Keep this worker compatible with versions that do not.
+                activate_retries = getattr(database, "activate_due_retries_and_resumes", None)
+                if callable(activate_retries):
+                    for campaign_id in activate_retries() or []:
+                        logger.info("[SCHEDULER] Activating retry/resume campaign_id=%s", campaign_id)
+                        self.enqueue(campaign_id)
+
+                cleanup = getattr(database, "cleanup_expired_attachment_files", None)
+                if callable(cleanup):
+                    cleanup(Config.ATTACHMENT_RETENTION_SECONDS)
             except Exception:
-                logger.exception("Scheduled campaign check failed")
+                logger.exception("[SCHEDULER] Scheduled campaign check failed")
             time.sleep(5)
 
     def _payload(self, campaign_id):
@@ -383,13 +451,31 @@ class CampaignManager:
 
     def _worker(self):
         connection, builder = SMTPConnectionManager(), EmailMessageBuilder()
+        logger.info("[WORKER] SMTP worker started; smtp_server=%s port=%s", Config.SMTP_SERVER, Config.SMTP_PORT)
         while True:
-            recipient_id = self.recipient_queue.get()
+            queue_item = self.recipient_queue.get()
             claimed = None
+            campaign_id = None
+            recipient_id = queue_item
+            if isinstance(queue_item, (tuple, list)) and len(queue_item) == 2:
+                campaign_id, recipient_id = queue_item
             try:
-                claimed = database.claim_recipient(recipient_id)
+                logger.info(
+                    "[WORKER] Picked campaign_id=%s recipient_id=%s recipient_queue_size=%s",
+                    campaign_id, recipient_id, self.recipient_queue.qsize(),
+                )
+                # Prefer campaign-scoped claiming when supported by the installed
+                # database.py; retain compatibility with its older one-argument API.
+                try:
+                    claimed = database.claim_recipient(recipient_id, campaign_id=campaign_id)
+                except TypeError as exc:
+                    if "campaign_id" not in str(exc):
+                        raise
+                    claimed = database.claim_recipient(recipient_id)
                 if not claimed:
+                    logger.warning("[WORKER] Could not claim recipient_id=%s; recipient may no longer be queued or campaign may be inactive", recipient_id)
                     continue
+                logger.info("[WORKER] Claimed recipient_id=%s campaign_id=%s email=%s", recipient_id, claimed.get("campaign_id"), claimed.get("email"))
                 campaign, attachments = self._payload(claimed["campaign_id"])
                 if estimate_message_size(campaign["body"], attachments, builder.logo_size) > Config.SMTP_MAX_MESSAGE_SIZE:
                     database.recipient_result(recipient_id, "failed", "Message exceeds configured SMTP size limit")
@@ -397,14 +483,15 @@ class CampaignManager:
                 build_started = time.monotonic()
                 sender = Config.smtp_username()
                 try:
-                    personalization = __import__("json").loads(claimed.get("personalization") or "{}")
-                except (__import__("json").JSONDecodeError, TypeError):
+                    personalization = json.loads(claimed.get("personalization") or "{}")
+                except (json.JSONDecodeError, TypeError):
                     personalization = {"Email": claimed["email"]}
-                if campaign.get("personalization_enabled", 0):
-                    personalized_subject = personalize_text(campaign["subject"], personalization)
-                    personalized_body = personalize_text(campaign["body"], personalization)
-                else:
-                    personalized_subject, personalized_body = campaign["subject"], campaign["body"]
+                # Rendering is safe for every campaign: text without placeholders
+                # remains unchanged, while known recipient fields are substituted.
+                # This also works with database schemas that do not persist a
+                # separate personalization_enabled campaign flag.
+                personalized_subject = personalize_text(campaign["subject"], personalization)
+                personalized_body = personalize_text(campaign["body"], personalization)
                 if any("\r" in value or "\n" in value for value in (personalized_subject,)):
                     raise ValueError("Personalized subject must not contain line breaks.")
                 message = builder.build(sender, claimed["email"], personalized_subject, personalized_body, attachments)
@@ -418,6 +505,7 @@ class CampaignManager:
                     database.record_attempt(recipient_id)
                     send_started = time.monotonic()
                     try:
+                        logger.info("[SMTP] Starting recipient_id=%s attempt=%s", recipient_id, attempt)
                         self._wait_for_rate_limit(); connection.send_message(message_bytes, claimed["email"], bool(attachments))
                         database.recipient_result(recipient_id, "sent")
                         logger.info("[PERF] recipient_id=%s attempt=%s send=%.2fs total=%.2fs SUCCESS", recipient_id, attempt, time.monotonic() - send_started, time.monotonic() - build_started)
